@@ -327,7 +327,7 @@ pub mod pallet {
 	/// in the "set" of Grandpa validators from genesis.
 	#[pallet::storage]
 	#[pallet::getter(fn current_set_id)]
-	pub(super) type CurrentSetId<T: Config> = StorageValue<_, SetId, ValueQuery>;
+	pub type CurrentSetId<T: Config> = StorageValue<_, SetId, ValueQuery>;
 
 	/// A mapping from grandpa set ID to the index of the *most recent* session for which its
 	/// members were responsible.
