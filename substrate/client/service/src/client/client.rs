@@ -116,7 +116,34 @@ where
 	telemetry: Option<TelemetryHandle>,
 	unpin_worker_sender: TracingUnboundedSender<UnpinWorkerMessage<Block>>,
 	code_provider: CodeProvider<Block, B, E>,
+	/// Optional state overrider to create storage replacements for bad history that can't be cleaned up.
+	/// NOTE: This does not fix the underlying storage and will not be "proveable.
+	state_overrider: Option<Box<dyn StateOverrider<Block>>>,
 	_phantom: PhantomData<RA>,
+}
+
+/// A callback allowing a caller to override runtime calls.
+pub trait StateOverrider<B: BlockT>: Send + Sync {
+	/// Should the intercept lookup the call version.
+	fn should_lookup_call_version(&self, function: &str) -> bool;
+	/// Optionally override the call to the runtime.
+	fn on_call(
+		&self,
+		at_block: &B::Hash,
+		at_number: NumberFor<B>,
+		spec_version: &RuntimeVersion,
+		function: &str,
+	) -> Option<Vec<u8>>;
+	/// Should the intercept lookup the storage version.
+	fn should_lookup_storage_version(&self, key: &StorageKey) -> bool;
+	/// Optionally override the storage read.
+	fn on_storage_read(
+		&self,
+		at_block: &B::Hash,
+		at_number: NumberFor<B>,
+		spec_version: &RuntimeVersion,
+		key: &StorageKey,
+	) -> Option<Vec<u8>>;
 }
 
 /// Used in importing a block, where additional changes are made after the runtime
@@ -457,8 +484,14 @@ where
 			telemetry,
 			unpin_worker_sender,
 			code_provider,
+			state_overrider: Default::default(),
 			_phantom: Default::default(),
 		})
+	}
+	/// Set the state overrider to be used for creating storage replacements for bad history that
+	/// can't be cleaned up.
+	pub fn set_state_overrider(&mut self, state_overrider: Box<dyn StateOverrider<Block>>) {
+		self.state_overrider = Some(state_overrider);
 	}
 
 	/// returns a reference to the block import notification sinks
@@ -1486,6 +1519,20 @@ where
 		hash: Block::Hash,
 		key: &StorageKey,
 	) -> sp_blockchain::Result<Option<StorageData>> {
+		if let Some(ref overrider) = self.state_overrider {
+			if overrider.should_lookup_storage_version(key) {
+				let version = self.runtime_version_at(hash);
+				let block_number = self.backend.blockchain().number(hash);
+				if let (Ok(Some(block_number)), Ok(runtime_version)) = (block_number, version) {
+					if let Some(result) =
+						overrider.on_storage_read(&hash, block_number, &runtime_version, key)
+					{
+						return Ok(Some(StorageData(result)));
+					}
+				}
+			}
+		}
+
 		Ok(self
 			.state_at(hash)?
 			.storage(&key.0)
@@ -1698,6 +1745,23 @@ where
 	type StateBackend = B::State;
 
 	fn call_api_at(&self, params: CallApiAtParams<Block>) -> Result<Vec<u8>, sp_api::ApiError> {
+		if let Some(overrider) = &self.state_overrider {
+			if overrider.should_lookup_call_version(params.function) {
+				if let (Ok(block_number), Ok(runtime_version)) = (
+					self.expect_block_number_from_id(&BlockId::Hash(params.at)),
+					self.runtime_version_at(params.at),
+				) {
+					if let Some(result) = overrider.on_call(
+						&params.at,
+						block_number,
+						&runtime_version,
+						params.function,
+					) {
+						return Ok(result);
+					}
+				}
+			}
+		}
 		self.executor
 			.contextual_call(
 				params.at,

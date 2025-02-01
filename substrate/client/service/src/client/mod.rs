@@ -53,7 +53,7 @@ mod wasm_override;
 mod wasm_substitutes;
 
 pub use call_executor::LocalCallExecutor;
-pub use client::{Client, ClientConfig};
+pub use client::{Client, ClientConfig, StateOverrider};
 pub(crate) use code_provider::CodeProvider;
 
 #[cfg(feature = "test-helpers")]

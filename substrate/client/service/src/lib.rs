@@ -41,6 +41,7 @@ use std::{
 };
 
 use codec::{Decode, Encode};
+pub use client::StateOverrider;
 use futures::{pin_mut, FutureExt, StreamExt};
 use jsonrpsee::RpcModule;
 use log::{debug, error, warn};
