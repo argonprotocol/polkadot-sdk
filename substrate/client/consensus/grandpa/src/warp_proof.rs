@@ -404,6 +404,271 @@ mod tests {
 	};
 
 	#[test]
+	fn verified_warp_checkpoint_imports_with_its_sparse_parent() {
+		use sc_client_api::{apply_aux, BlockBackend, LockImportRun};
+		use sc_client_db::{Backend, BlocksPruning, DatabaseSettings, DatabaseSource, PruningMode};
+		use sc_consensus::{
+			BlockImport, BlockImportParams, ForkChoiceStrategy, ImportResult, ImportedState,
+			StateAction, StorageChanges,
+		};
+		use sc_network_sync::strategy::warp::{EncodedProof, VerificationResult, Verifier};
+		use sp_runtime::traits::{Block as _, Hash as _, Header as _};
+		use sp_state_machine::Backend as _;
+		use substrate_test_runtime_client::runtime::{GRANDPA_AUTHORITIES_KEY, GRANDPA_SET_ID_KEY};
+
+		let genesis_authorities = vec![(Ed25519Keyring::Alice.public().into(), 1)];
+		let next_authorities = vec![(Ed25519Keyring::Bob.public().into(), 1)];
+		let builder = TestClientBuilder::new()
+			.add_extra_storage(GRANDPA_AUTHORITIES_KEY, genesis_authorities.encode());
+		let backend = builder.backend();
+		let source = Arc::new(builder.build());
+		let mut blocks = Vec::new();
+
+		// G -> 1 -> 2 (authority change) -> 3 (state checkpoint).
+		for number in 1..=3 {
+			let mut builder = BlockBuilderBuilder::new(&*source)
+				.on_parent_block(source.info().best_hash)
+				.with_parent_block_number(number - 1)
+				.build()
+				.unwrap();
+			if number == 2 {
+				builder
+					.push_deposit_log_digest_item(sp_runtime::DigestItem::Consensus(
+						GRANDPA_ENGINE_ID,
+						sp_consensus_grandpa::ConsensusLog::ScheduledChange(
+							sp_consensus_grandpa::ScheduledChange {
+								delay: 0u64,
+								next_authorities: next_authorities.clone(),
+							},
+						)
+						.encode(),
+					))
+					.unwrap();
+				builder
+					.push_storage_change(
+						GRANDPA_AUTHORITIES_KEY.to_vec(),
+						Some(next_authorities.encode()),
+					)
+					.unwrap();
+				builder
+					.push_storage_change(GRANDPA_SET_ID_KEY.to_vec(), Some(1u64.encode()))
+					.unwrap();
+			}
+			let block = builder.build().unwrap().block;
+			futures::executor::block_on(source.import(BlockOrigin::Own, block.clone())).unwrap();
+			blocks.push(block);
+		}
+
+		// The old set finalizes the handoff; the new set finalizes the checkpoint.
+		for (index, signer, set_id) in [(1, Ed25519Keyring::Alice, 0), (2, Ed25519Keyring::Bob, 1)]
+		{
+			let target_hash = blocks[index].hash();
+			let target_number = *blocks[index].header.number();
+			let precommit = finality_grandpa::Precommit { target_hash, target_number };
+			let payload = sp_consensus_grandpa::localized_payload(
+				42,
+				set_id,
+				&finality_grandpa::Message::Precommit(precommit.clone()),
+			);
+			let commit = finality_grandpa::Commit {
+				target_hash,
+				target_number,
+				precommits: vec![finality_grandpa::SignedPrecommit {
+					precommit,
+					signature: signer.sign(&payload).into(),
+					id: signer.public().into(),
+				}],
+			};
+			let justification = GrandpaJustification::from_commit(&source, 42, commit).unwrap();
+			source
+				.finalize_block(target_hash, Some((GRANDPA_ENGINE_ID, justification.encode())))
+				.unwrap();
+			if index == 2 {
+				source
+					.lock_import_and_run(|import_op| {
+						crate::aux_schema::update_best_justification(&justification, |insert| {
+							apply_aux(import_op, insert, &[])
+						})
+					})
+					.unwrap();
+			}
+		}
+		let proof = WarpSyncProof::generate(
+			&*backend,
+			source.info().genesis_hash,
+			&AuthoritySetChanges::from(vec![(0, 2)]),
+		)
+		.unwrap();
+		let mut verifier: super::GrandpaVerifier<substrate_test_runtime_client::runtime::Block> =
+			super::GrandpaVerifier {
+				state: super::VerifierState {
+					set_id: 0,
+					authorities: genesis_authorities.clone(),
+					next_proof_context: source.info().genesis_hash,
+				},
+				hard_forks: Default::default(),
+				eras_synced: 0,
+			};
+		let VerificationResult::Complete(checkpoint, headers) =
+			verifier.verify(&EncodedProof(proof.encode())).unwrap()
+		else {
+			panic!("expected a complete verified proof")
+		};
+		assert_eq!(headers.iter().map(|(h, _)| *h.number()).collect::<Vec<_>>(), vec![2, 3]);
+		let checkpoint_state = source.state_at(checkpoint.hash()).unwrap();
+		let pairs = checkpoint_state
+			.pairs(Default::default())
+			.unwrap()
+			.collect::<Result<Vec<_>, _>>()
+			.unwrap();
+		let state = ImportedState {
+			block: checkpoint.hash(),
+			state: sp_state_machine::KeyValueStates(vec![sp_state_machine::KeyValueStorageLevel {
+				state_root: Vec::new(),
+				parent_storage_keys: Vec::new(),
+				key_values: pairs,
+			}]),
+		};
+		let root = sp_runtime::traits::BlakeTwo256::trie_root(
+			state.state.0[0].key_values.clone(),
+			sp_runtime::StateVersion::V1,
+		);
+		assert_eq!(root, *checkpoint.state_root(), "snapshot export must match the checkpoint");
+		let next_block = BlockBuilderBuilder::new(&*source)
+			.on_parent_block(checkpoint.hash())
+			.with_parent_block_number(3)
+			.build()
+			.unwrap()
+			.build()
+			.unwrap()
+			.block;
+
+		// The no-parent control must work before testing the proof's sparse parent.
+		for retain_parent in [false, true] {
+			let directory = tempfile::tempdir().unwrap();
+			let open_backend = || {
+				Arc::new(
+					Backend::new(
+						DatabaseSettings {
+							trie_cache_maximum_size: Some(1 << 20),
+							state_pruning: Some(PruningMode::blocks_pruning(256)),
+							blocks_pruning: BlocksPruning::KeepAll,
+							pruning_filters: Vec::new(),
+							source: DatabaseSource::ParityDb { path: directory.path().into() },
+							metrics_registry: None,
+						},
+						0,
+					)
+					.unwrap(),
+				)
+			};
+			let builder = TestClientBuilder::with_backend(open_backend())
+				.add_extra_storage(GRANDPA_AUTHORITIES_KEY, genesis_authorities.encode())
+				.set_no_genesis();
+			let backend = builder.backend();
+			let client = Arc::new(builder.build());
+			let genesis = source.header(source.info().genesis_hash).unwrap().unwrap();
+			let mut import = BlockImportParams::new(BlockOrigin::WarpSync, genesis);
+			import.state_action = StateAction::Skip;
+			import.fork_choice = Some(ForkChoiceStrategy::Custom(false));
+			futures::executor::block_on((&*client).import_block(import)).unwrap();
+			let (grandpa_import, link) = crate::block_import(
+				client.clone(),
+				512,
+				&source,
+				sc_consensus::LongestChain::new(backend),
+				None,
+			)
+			.unwrap();
+			if retain_parent {
+				let (parent, _) = headers[0].clone();
+				let mut import = BlockImportParams::new(BlockOrigin::WarpSync, parent);
+				import.state_action = StateAction::Skip;
+				import.fork_choice = Some(ForkChoiceStrategy::Custom(false));
+				futures::executor::block_on(grandpa_import.import_block(import)).unwrap();
+			}
+			assert!(client.header(blocks[0].hash()).unwrap().is_none());
+			let mut import =
+				BlockImportParams::new(BlockOrigin::NetworkInitialSync, checkpoint.clone());
+			import.body = Some(blocks[2].extrinsics.clone());
+			import.state_action = StateAction::ApplyChanges(StorageChanges::Import(state.clone()));
+			import.import_existing = true;
+			import.fork_choice = Some(ForkChoiceStrategy::Custom(true));
+			let result = futures::executor::block_on(grandpa_import.import_block(import));
+			assert!(
+				matches!(result, Ok(ImportResult::Imported(_))),
+				"retain_parent={retain_parent}: {result:?}"
+			);
+			assert_eq!(client.info().finalized_hash, checkpoint.hash());
+			assert!(client.state_at(checkpoint.hash()).is_ok());
+			assert_eq!(link.shared_authority_set().set_id(), 1);
+			assert_eq!(
+				link.shared_authority_set().clone_inner().current_authorities,
+				next_authorities
+			);
+			let gap = client.info().block_gap.unwrap();
+			assert_eq!((gap.start, gap.end), (1, 2));
+			assert_eq!(gap.gap_type, sp_blockchain::BlockGapType::MissingHeaderAndBody);
+
+			// Reopen before executing descendants or backfilling the sparse proof history.
+			drop(link);
+			drop(grandpa_import);
+			drop(client);
+			let builder = TestClientBuilder::with_backend(open_backend())
+				.add_extra_storage(GRANDPA_AUTHORITIES_KEY, genesis_authorities.encode())
+				.set_no_genesis();
+			let backend = builder.backend();
+			let client = Arc::new(builder.build());
+			assert_eq!(client.info().best_hash, checkpoint.hash());
+			assert_eq!(client.info().finalized_hash, checkpoint.hash());
+			assert_eq!(client.info().finalized_state, Some((checkpoint.hash(), 3)));
+			assert_eq!(client.info().block_gap, Some(gap));
+			assert!(client.code_at(checkpoint.hash()).is_ok());
+			let (grandpa_import, link) = crate::block_import(
+				client.clone(),
+				512,
+				&source,
+				sc_consensus::LongestChain::new(backend),
+				None,
+			)
+			.unwrap();
+			assert_eq!(link.shared_authority_set().set_id(), 1);
+			assert_eq!(
+				link.shared_authority_set().clone_inner().current_authorities,
+				next_authorities
+			);
+
+			let mut import =
+				BlockImportParams::new(BlockOrigin::NetworkBroadcast, next_block.header.clone());
+			import.body = Some(next_block.extrinsics.clone());
+			import.fork_choice = Some(ForkChoiceStrategy::Custom(true));
+			assert!(matches!(
+				futures::executor::block_on(grandpa_import.import_block(import)).unwrap(),
+				ImportResult::Imported(_)
+			));
+			assert_eq!(client.info().best_hash, next_block.hash());
+			assert!(client.state_at(next_block.hash()).is_ok());
+
+			// Gap sync must also fill the body of an already-retained proof header.
+			for block in &blocks[..2] {
+				let mut import = BlockImportParams::new(BlockOrigin::GapSync, block.header.clone());
+				import.body = Some(block.extrinsics.clone());
+				import.justifications = source.justifications(block.hash()).unwrap();
+				import.state_action = StateAction::Skip;
+				import.import_existing = true;
+				import.fork_choice = Some(ForkChoiceStrategy::Custom(false));
+				assert!(matches!(
+					futures::executor::block_on(grandpa_import.import_block(import)).unwrap(),
+					ImportResult::Imported(_)
+				));
+			}
+			assert!(client.info().block_gap.is_none());
+			assert_eq!(client.info().finalized_hash, checkpoint.hash());
+			assert_eq!(client.info().best_hash, next_block.hash());
+		}
+	}
+
+	#[test]
 	fn warp_sync_proof_generate_verify() {
 		let mut rng = rand::rngs::StdRng::from_seed([0; 32]);
 		let builder = TestClientBuilder::new();

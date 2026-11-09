@@ -1398,11 +1398,12 @@ impl<Block: BlockT> Backend<Block> {
 	///
 	/// In the case where the new best block is a block to be imported, `route_to`
 	/// should be the parent of `best_to`. In the case where we set an existing block
-	/// to be best, `route_to` should equal to `best_to`.
+	/// to be best, `route_to` should equal to `best_to`. Use `None` for the first state
+	/// checkpoint, whose retained warp headers may have incomplete ancestry.
 	fn set_head_with_transaction(
 		&self,
 		transaction: &mut Transaction<DbHash>,
-		route_to: Block::Hash,
+		route_to: Option<Block::Hash>,
 		best_to: (NumberFor<Block>, Block::Hash),
 	) -> ClientResult<(Vec<Block::Hash>, Vec<Block::Hash>)> {
 		let mut enacted = Vec::default();
@@ -1418,11 +1419,18 @@ impl<Block: BlockT> Backend<Block> {
 			return Err(sp_blockchain::Error::SetHeadTooOld);
 		}
 
-		let parent_exists =
-			self.blockchain.status(route_to)? == sp_blockchain::BlockStatus::InChain;
+		let route_to = match route_to {
+			Some(hash)
+				if meta.best_hash != Default::default() &&
+					self.blockchain.status(hash)? == sp_blockchain::BlockStatus::InChain =>
+			{
+				Some(hash)
+			},
+			_ => None,
+		};
 
-		// Cannot find tree route with empty DB or when imported a detached block.
-		if meta.best_hash != Default::default() && parent_exists {
+		// Cannot find tree route with empty DB or when importing the first state checkpoint.
+		if let Some(route_to) = route_to {
 			let tree_route = sp_blockchain::tree_route(&self.blockchain, meta.best_hash, route_to)?;
 
 			// uncanonicalize: check safety violations and ensure the numbers no longer
@@ -1628,8 +1636,14 @@ impl<Block: BlockT> Backend<Block> {
 			// blocks are keyed by number + hash.
 			let lookup_key = utils::number_and_hash_to_lookup_key(number, hash)?;
 
+			let initial_state_import = operation.reset_storage &&
+				pending_block.leaf_state.is_final() &&
+				last_finalized_num.is_zero() &&
+				self.blockchain.meta.read().finalized_state.is_none();
+
 			if pending_block.leaf_state.is_best() {
-				self.set_head_with_transaction(&mut transaction, parent_hash, (number, hash))?;
+				let route_to = if initial_state_import { None } else { Some(parent_hash) };
+				self.set_head_with_transaction(&mut transaction, route_to, (number, hash))?;
 			};
 
 			utils::insert_hash_to_key_mapping(&mut transaction, columns::KEY_LOOKUP, number, hash)?;
@@ -1927,7 +1941,7 @@ impl<Block: BlockT> Backend<Block> {
 					}
 				} else if operation.create_gap {
 					if number > best_num + One::one() &&
-						self.blockchain.header(parent_hash)?.is_none()
+						(initial_state_import || self.blockchain.header(parent_hash)?.is_none())
 					{
 						let gap = BlockGap {
 							start: best_num + One::one(),
@@ -1972,7 +1986,7 @@ impl<Block: BlockT> Backend<Block> {
 				let number = header.number();
 				let hash = header.hash();
 
-				self.set_head_with_transaction(&mut transaction, hash, (*number, hash))?;
+				self.set_head_with_transaction(&mut transaction, Some(hash), (*number, hash))?;
 
 				meta_updates.push(MetaUpdate {
 					hash,

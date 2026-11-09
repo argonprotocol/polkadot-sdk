@@ -20282,9 +20282,11 @@ dependencies = [
  "sp-keyring",
  "sp-keystore 0.46.0",
  "sp-runtime 46.0.0",
+ "sp-state-machine 0.50.0",
  "sp-tracing 19.0.0",
  "substrate-prometheus-endpoint 0.17.7",
  "substrate-test-runtime-client",
+ "tempfile",
  "thiserror 1.0.65",
  "tokio",
 ]

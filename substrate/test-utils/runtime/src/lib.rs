@@ -78,6 +78,11 @@ use sp_version::RuntimeVersion;
 
 pub use sp_consensus_babe::{AllowedSlots, BabeEpochConfiguration, Slot};
 
+/// Storage key for the test runtime's GRANDPA authorities.
+pub const GRANDPA_AUTHORITIES_KEY: &[u8] = b":grandpa_authorities";
+/// Storage key for the test runtime's GRANDPA set ID.
+pub const GRANDPA_SET_ID_KEY: &[u8] = b":grandpa_set_id";
+
 pub use pallet_balances::Call as BalancesCall;
 pub use pallet_utility::Call as UtilityCall;
 
@@ -390,6 +395,7 @@ parameter_types! {
 
 #[derive_impl(frame_system::config_preludes::TestDefaultConfig)]
 impl frame_system::pallet::Config for Runtime {
+	type Version = Version;
 	type BlockWeights = RuntimeBlockWeights;
 	type Nonce = Nonce;
 	type AccountId = AccountId;
@@ -761,11 +767,15 @@ impl_runtime_apis! {
 
 	impl sp_consensus_grandpa::GrandpaApi<Block> for Runtime {
 		fn grandpa_authorities() -> sp_consensus_grandpa::AuthorityList {
-			Vec::new()
+			sp_io::storage::get(GRANDPA_AUTHORITIES_KEY)
+				.and_then(|encoded| Decode::decode(&mut &encoded[..]).ok())
+				.unwrap_or_default()
 		}
 
 		fn current_set_id() -> sp_consensus_grandpa::SetId {
-			0
+			sp_io::storage::get(GRANDPA_SET_ID_KEY)
+				.and_then(|encoded| Decode::decode(&mut &encoded[..]).ok())
+				.unwrap_or_default()
 		}
 
 		fn submit_report_equivocation_unsigned_extrinsic(
