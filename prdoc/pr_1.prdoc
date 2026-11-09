@@ -1,0 +1,18 @@
+title: Preserve finality during state recovery and sparse warp checkpoint import
+doc:
+- audience: Node Dev
+  description: |-
+    Restoring state for existing canonical headers preserves the finalized chain head and persists the restored-state cursor across restart.
+    State replay rechecks committed and staged finality before writing, so a competing finalized branch cannot leave a stale-fork recovery checkpoint.
+    The first finalized warp checkpoint can be imported when retained proof headers have incomplete ancestry. The missing-history gap remains available for backfill.
+crates:
+- name: sc-client-db
+  bump: patch
+- name: sc-service
+  bump: patch
+- name: sc-consensus-grandpa
+  bump: none
+- name: sc-service-test
+  bump: none
+- name: substrate-test-runtime
+  bump: none

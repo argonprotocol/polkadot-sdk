@@ -59,6 +59,108 @@ mod db;
 
 const TEST_ENGINE_ID: ConsensusEngineId = *b"TEST";
 
+#[test]
+fn restoring_state_for_an_existing_header_preserves_finality() {
+	for pruning in
+		[PruningMode::ArchiveAll, PruningMode::ArchiveCanonical, PruningMode::blocks_pruning(1)]
+	{
+		let source = substrate_test_runtime_client::new();
+		let directory = tempfile::tempdir().unwrap();
+		let open_backend = || {
+			Arc::new(
+				Backend::new(
+					DatabaseSettings {
+						trie_cache_maximum_size: Some(1 << 20),
+						state_pruning: Some(pruning.clone()),
+						blocks_pruning: BlocksPruning::KeepAll,
+						pruning_filters: Vec::new(),
+						source: DatabaseSource::ParityDb { path: directory.path().into() },
+						metrics_registry: None,
+					},
+					u64::MAX,
+				)
+				.unwrap(),
+			)
+		};
+		let mut client = TestClientBuilder::with_backend(open_backend()).build();
+		let mut blocks = Vec::new();
+
+		// Download three valid headers while retaining only genesis state.
+		for number in 1..=3 {
+			let block = BlockBuilderBuilder::new(&source)
+				.on_parent_block(source.info().best_hash)
+				.with_parent_block_number(number - 1)
+				.build()
+				.unwrap()
+				.build()
+				.unwrap()
+				.block;
+			block_on(source.import(BlockOrigin::Own, block.clone())).unwrap();
+
+			let mut header =
+				BlockImportParams::new(BlockOrigin::NetworkInitialSync, block.header.clone());
+			header.state_action = sc_consensus::StateAction::Skip;
+			header.fork_choice = Some(ForkChoiceStrategy::Custom(false));
+			block_on((&client).import_block(header)).unwrap();
+			blocks.push(block);
+		}
+		assert_eq!(client.info().best_number, 0);
+		let finalized = blocks[2].hash();
+		client.finalize_block(finalized, None).unwrap();
+		assert_eq!(client.info().finalized_number, 3);
+		assert_eq!(client.info().finalized_state, Some((client.info().genesis_hash, 0)));
+		assert!(client.code_at(blocks[0].hash()).is_err());
+
+		// Restore state in order, reopening the same database after each block.
+		for block in &blocks {
+			let mut replay =
+				BlockImportParams::new(BlockOrigin::NetworkInitialSync, block.header.clone());
+			replay.body = Some(block.extrinsics.clone());
+			replay.import_existing = true;
+			replay.fork_choice = Some(ForkChoiceStrategy::Custom(false));
+			assert!(matches!(
+				block_on((&client).import_block(replay)).unwrap(),
+				ImportResult::Imported(_)
+			));
+			assert!(client.code_at(block.hash()).is_ok());
+			assert_eq!(client.info().finalized_hash, finalized);
+			assert_eq!(client.info().finalized_state, Some((block.hash(), *block.header.number())));
+
+			drop(client);
+			client = TestClientBuilder::with_backend(open_backend()).build();
+			let info = client.info();
+			assert_eq!((info.finalized_hash, info.finalized_number), (finalized, 3));
+			assert_eq!((info.best_hash, info.best_number), (finalized, 3));
+			assert_eq!(info.finalized_state, Some((block.hash(), *block.header.number())));
+			assert!(client.code_at(block.hash()).is_ok());
+		}
+		if matches!(pruning, PruningMode::ArchiveAll) {
+			// Direct imports can bypass the queue's already-stateful block check.
+			let block = &blocks[0];
+			let mut replay =
+				BlockImportParams::new(BlockOrigin::NetworkInitialSync, block.header.clone());
+			replay.body = Some(block.extrinsics.clone());
+			replay.import_existing = true;
+			replay.fork_choice = Some(ForkChoiceStrategy::Custom(false));
+			assert!(matches!(
+				block_on((&client).import_block(replay)).unwrap(),
+				ImportResult::Imported(_)
+			));
+			assert_eq!(client.info().finalized_hash, finalized);
+			assert_eq!(client.info().finalized_state, Some((finalized, 3)));
+
+			drop(client);
+			client = TestClientBuilder::with_backend(open_backend()).build();
+			assert_eq!(client.info().finalized_hash, finalized);
+			assert_eq!(client.info().finalized_state, Some((finalized, 3)));
+			assert!(client.code_at(finalized).is_ok());
+		}
+		if matches!(pruning, PruningMode::Constrained(_)) {
+			assert!(client.code_at(client.info().genesis_hash).is_err());
+		}
+	}
+}
+
 fn construct_block(
 	backend: &InMemoryBackend<BlakeTwo256>,
 	number: BlockNumber,

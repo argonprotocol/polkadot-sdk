@@ -1398,11 +1398,12 @@ impl<Block: BlockT> Backend<Block> {
 	///
 	/// In the case where the new best block is a block to be imported, `route_to`
 	/// should be the parent of `best_to`. In the case where we set an existing block
-	/// to be best, `route_to` should equal to `best_to`.
+	/// to be best, `route_to` should equal to `best_to`. Use `None` for the first state
+	/// checkpoint, whose retained warp headers may have incomplete ancestry.
 	fn set_head_with_transaction(
 		&self,
 		transaction: &mut Transaction<DbHash>,
-		route_to: Block::Hash,
+		route_to: Option<Block::Hash>,
 		best_to: (NumberFor<Block>, Block::Hash),
 	) -> ClientResult<(Vec<Block::Hash>, Vec<Block::Hash>)> {
 		let mut enacted = Vec::default();
@@ -1418,11 +1419,18 @@ impl<Block: BlockT> Backend<Block> {
 			return Err(sp_blockchain::Error::SetHeadTooOld);
 		}
 
-		let parent_exists =
-			self.blockchain.status(route_to)? == sp_blockchain::BlockStatus::InChain;
+		let route_to = match route_to {
+			Some(hash)
+				if meta.best_hash != Default::default() &&
+					self.blockchain.status(hash)? == sp_blockchain::BlockStatus::InChain =>
+			{
+				Some(hash)
+			},
+			_ => None,
+		};
 
-		// Cannot find tree route with empty DB or when imported a detached block.
-		if meta.best_hash != Default::default() && parent_exists {
+		// Cannot find tree route with empty DB or when importing the first state checkpoint.
+		if let Some(route_to) = route_to {
 			let tree_route = sp_blockchain::tree_route(&self.blockchain, meta.best_hash, route_to)?;
 
 			// uncanonicalize: check safety violations and ensure the numbers no longer
@@ -1571,6 +1579,8 @@ impl<Block: BlockT> Backend<Block> {
 	}
 
 	fn try_commit_operation(&self, mut operation: BlockImportOperation<Block>) -> ClientResult<()> {
+		self.ensure_state_reimport_finality(&operation)?;
+
 		let mut transaction = Transaction::new();
 
 		operation.apply_aux(&mut transaction);
@@ -1583,6 +1593,7 @@ impl<Block: BlockT> Backend<Block> {
 		};
 
 		let mut block_gap_updated = false;
+		let mut restored_finalized_state = None;
 
 		let mut current_transaction_justifications: HashMap<Block::Hash, Justification> =
 			HashMap::new();
@@ -1625,8 +1636,14 @@ impl<Block: BlockT> Backend<Block> {
 			// blocks are keyed by number + hash.
 			let lookup_key = utils::number_and_hash_to_lookup_key(number, hash)?;
 
+			let initial_state_import = operation.reset_storage &&
+				pending_block.leaf_state.is_final() &&
+				last_finalized_num.is_zero() &&
+				self.blockchain.meta.read().finalized_state.is_none();
+
 			if pending_block.leaf_state.is_best() {
-				self.set_head_with_transaction(&mut transaction, parent_hash, (number, hash))?;
+				let route_to = if initial_state_import { None } else { Some(parent_hash) };
+				self.set_head_with_transaction(&mut transaction, route_to, (number, hash))?;
 			};
 
 			utils::insert_hash_to_key_mapping(&mut transaction, columns::KEY_LOOKUP, number, hash)?;
@@ -1736,13 +1753,43 @@ impl<Block: BlockT> Backend<Block> {
 						>,
 					)?;
 					apply_state_commit(&mut transaction, commit);
-					meta_updates.push(MetaUpdate {
-						hash,
-						number,
-						is_best: false,
-						is_finalized: true,
-						with_state: true,
-					});
+					let mut checkpoint = (hash, number);
+					if !operation.reset_storage {
+						// Administrative revert can leave the cached checkpoint invalid.
+						let newer_state = {
+							let meta = self.blockchain.meta.read();
+							meta.finalized_state.filter(|(_, state_number)| {
+								*state_number > number && *state_number <= meta.finalized_number
+							})
+						};
+						if let Some((state_hash, state_number)) = newer_state {
+							let canonical_hash = self.blockchain.hash(state_number)?;
+							let is_usable = canonical_hash == Some(state_hash) &&
+								sc_client_api::Backend::have_state_at(
+									self,
+									state_hash,
+									state_number,
+								);
+							if is_usable {
+								checkpoint = (state_hash, state_number);
+							}
+						}
+
+						// These finalizations have not reached the canonical-number index yet.
+						for update in &meta_updates {
+							if update.with_state && update.number > checkpoint.1 {
+								checkpoint = (update.hash, update.number);
+							}
+						}
+					}
+
+					// Persist even an unchanged checkpoint: startup can recover it only in memory.
+					transaction.set_from_vec(
+						columns::META,
+						meta_keys::FINALIZED_STATE,
+						utils::number_and_hash_to_lookup_key(checkpoint.1, checkpoint.0)?,
+					);
+					restored_finalized_state = Some(checkpoint);
 				}
 
 				// Check if need to finalize. Genesis is always finalized instantly.
@@ -1894,7 +1941,7 @@ impl<Block: BlockT> Backend<Block> {
 					}
 				} else if operation.create_gap {
 					if number > best_num + One::one() &&
-						self.blockchain.header(parent_hash)?.is_none()
+						(initial_state_import || self.blockchain.header(parent_hash)?.is_none())
 					{
 						let gap = BlockGap {
 							start: best_num + One::one(),
@@ -1939,7 +1986,7 @@ impl<Block: BlockT> Backend<Block> {
 				let number = header.number();
 				let hash = header.hash();
 
-				self.set_head_with_transaction(&mut transaction, hash, (*number, hash))?;
+				self.set_head_with_transaction(&mut transaction, Some(hash), (*number, hash))?;
 
 				meta_updates.push(MetaUpdate {
 					hash,
@@ -1978,10 +2025,54 @@ impl<Block: BlockT> Backend<Block> {
 		for m in meta_updates {
 			self.blockchain.update_meta(m);
 		}
+		if let Some(state) = restored_finalized_state {
+			self.blockchain.meta.write().finalized_state = Some(state);
+		}
 		if block_gap_updated {
 			self.blockchain.update_block_gap(block_gap);
 		}
 
+		Ok(())
+	}
+
+	// State preparation can race with header finalization. Recheck at commitment before
+	// mutating the state database or publishing a new executable checkpoint.
+	fn ensure_state_reimport_finality(
+		&self,
+		operation: &BlockImportOperation<Block>,
+	) -> ClientResult<()> {
+		if !operation.commit_state {
+			return Ok(());
+		}
+		let Some(block) = &operation.pending_block else { return Ok(()) };
+		let number = *block.header.number();
+		if number.is_zero() {
+			return Ok(());
+		}
+		let hash = block.header.hash();
+		if self.blockchain.header(hash)?.is_none() {
+			return Ok(());
+		}
+
+		let finalized_number = self.blockchain.meta.read().finalized_number;
+		if number <= finalized_number {
+			if self.blockchain.hash(number)? != Some(hash) {
+				return Err(ClientError::NotInFinalizedChain);
+			}
+			return Ok(());
+		}
+
+		let Some((finalized_hash, _)) = operation.finalized_blocks.last() else { return Ok(()) };
+		let finalized_header = self.blockchain.expect_header(*finalized_hash)?;
+		if number > *finalized_header.number() {
+			return Ok(());
+		}
+		if hash == *finalized_hash {
+			return Ok(());
+		}
+		if !is_descendent_of(&self.blockchain, None)(&hash, finalized_hash)? {
+			return Err(ClientError::NotInFinalizedChain);
+		}
 		Ok(())
 	}
 
@@ -4574,6 +4665,295 @@ pub(crate) mod tests {
 		op.set_block_data(header, None, None, None, NewBlockState::Best, true).unwrap();
 		backend.commit_operation(op).unwrap();
 		assert_eq!(backend.blockchain().info().best_hash, block2);
+	}
+
+	#[test]
+	fn state_replay_rejects_a_fork_finalized_during_preparation() {
+		let source = Backend::<Block>::new_test(100, u64::MAX);
+		let directory = tempfile::tempdir().unwrap();
+		let open_backend = || {
+			Backend::<Block>::new(
+				DatabaseSettings {
+					trie_cache_maximum_size: None,
+					state_pruning: Some(PruningMode::blocks_pruning(100)),
+					blocks_pruning: BlocksPruning::KeepAll,
+					pruning_filters: Vec::new(),
+					source: DatabaseSource::ParityDb { path: directory.path().into() },
+					metrics_registry: None,
+				},
+				u64::MAX,
+			)
+			.unwrap()
+		};
+		let backend = open_backend();
+		let genesis = insert_header(&source, 0, H256::zero(), None, H256::zero());
+		assert_eq!(insert_header(&backend, 0, H256::zero(), None, H256::zero()), genesis);
+		let canonical = insert_header(&source, 1, genesis, None, H256::zero());
+		let header = source.blockchain().header(canonical).unwrap().unwrap();
+		let mut fork = header.clone();
+		fork.extrinsics_root = H256::repeat_byte(1);
+
+		for (header, state) in
+			[(header, NewBlockState::Best), (fork.clone(), NewBlockState::Normal)]
+		{
+			let mut operation = backend.begin_operation().unwrap();
+			operation.set_block_data(header, Some(vec![]), None, None, state, true).unwrap();
+			backend.commit_operation(operation).unwrap();
+		}
+
+		let mut replay = backend.begin_operation().unwrap();
+		backend.begin_state_operation(&mut replay, genesis).unwrap();
+		let (root, changes) = replay.state().unwrap().unwrap().storage_root(
+			[(genesis.as_ref(), Some(genesis.as_ref()))].into_iter(),
+			StateVersion::V1,
+		);
+		assert_eq!(root, fork.state_root);
+		replay.update_db_storage(changes).unwrap();
+		replay.insert_aux([(b"rejected-replay".to_vec(), Some(vec![1]))]).unwrap();
+		replay
+			.set_block_data(fork.clone(), Some(vec![]), None, None, NewBlockState::Normal, true)
+			.unwrap();
+
+		backend.finalize_block(canonical, None).unwrap();
+		let leaves = backend.blockchain().leaves().unwrap();
+		let result = backend.commit_operation(replay);
+		assert_eq!(backend.blockchain().info().finalized_state, Some((genesis, 0)));
+		assert!(matches!(result, Err(ClientError::NotInFinalizedChain)));
+		assert_eq!(backend.blockchain().info().finalized_hash, canonical);
+		assert_eq!(backend.blockchain().leaves().unwrap(), leaves);
+		assert!(!backend.have_state_at(fork.hash(), 1));
+		assert_eq!(backend.get_aux(b"rejected-replay").unwrap(), None);
+
+		drop(backend);
+		let backend = open_backend();
+		assert_eq!(backend.blockchain().info().finalized_hash, canonical);
+		assert_eq!(backend.blockchain().info().finalized_state, Some((genesis, 0)));
+		assert!(!backend.have_state_at(fork.hash(), 1));
+		assert_eq!(backend.get_aux(b"rejected-replay").unwrap(), None);
+	}
+
+	#[test]
+	fn state_replay_checks_finality_staged_in_the_same_operation() {
+		for replay_finalized_branch in [false, true] {
+			let backend = Backend::<Block>::new_test(100, u64::MAX);
+			let source = Backend::<Block>::new_test(100, u64::MAX);
+			let genesis = insert_header(&source, 0, H256::zero(), None, H256::zero());
+			insert_header(&backend, 0, H256::zero(), None, H256::zero());
+			let best = insert_header(&source, 1, genesis, None, H256::zero());
+			let finalized = insert_header(&source, 1, genesis, None, H256::repeat_byte(2));
+			let child = insert_header(&source, 2, finalized, None, H256::zero());
+			let best_header = source.blockchain().header(best).unwrap().unwrap();
+			let finalized_header = source.blockchain().header(finalized).unwrap().unwrap();
+
+			for (hash, state) in [
+				(best, NewBlockState::Best),
+				(finalized, NewBlockState::Normal),
+				(child, NewBlockState::Normal),
+			] {
+				let mut operation = backend.begin_operation().unwrap();
+				let header = source.blockchain().header(hash).unwrap().unwrap();
+				operation.set_block_data(header, Some(vec![]), None, None, state, true).unwrap();
+				backend.commit_operation(operation).unwrap();
+			}
+			assert_eq!(backend.blockchain().hash(1).unwrap(), Some(best));
+			let leaves = backend.blockchain().leaves().unwrap();
+
+			let mut replay = backend.begin_operation().unwrap();
+			backend.begin_state_operation(&mut replay, genesis).unwrap();
+			let (_, changes) = replay.state().unwrap().unwrap().storage_root(
+				[(genesis.as_ref(), Some(genesis.as_ref()))].into_iter(),
+				StateVersion::V1,
+			);
+			replay.update_db_storage(changes).unwrap();
+			replay.mark_finalized(finalized, None).unwrap();
+			replay.mark_finalized(child, None).unwrap();
+			replay.mark_head(child).unwrap();
+			let header = if replay_finalized_branch { finalized_header } else { best_header };
+			replay
+				.set_block_data(header, Some(vec![]), None, None, NewBlockState::Normal, true)
+				.unwrap();
+
+			let result = backend.commit_operation(replay);
+			if replay_finalized_branch {
+				result.unwrap();
+				assert_eq!(backend.blockchain().info().finalized_hash, child);
+				assert_eq!(backend.blockchain().info().finalized_state, Some((finalized, 1)));
+				assert_eq!(backend.blockchain().hash(1).unwrap(), Some(finalized));
+			} else {
+				assert!(matches!(result, Err(ClientError::NotInFinalizedChain)));
+				assert_eq!(backend.blockchain().info().finalized_hash, genesis);
+				assert_eq!(backend.blockchain().info().finalized_state, Some((genesis, 0)));
+				assert_eq!(backend.blockchain().hash(1).unwrap(), Some(best));
+				assert_eq!(backend.blockchain().leaves().unwrap(), leaves);
+				assert!(!backend.have_state_at(best, 1));
+			}
+		}
+	}
+
+	#[test]
+	fn state_replay_preserves_newer_state_finalized_in_the_same_operation() {
+		let backend = Backend::<Block>::new_test_with_tx_storage(BlocksPruning::KeepAll, u64::MAX);
+		let genesis = insert_header(&backend, 0, H256::zero(), None, H256::zero());
+		let block1 = insert_header(&backend, 1, genesis, None, H256::zero());
+		let block2 = insert_header(&backend, 2, block1, None, H256::zero());
+		let block3 = insert_header(&backend, 3, block2, None, H256::zero());
+		assert_eq!(backend.blockchain().info().finalized_state, Some((genesis, 0)));
+
+		let mut replay = backend.begin_operation().unwrap();
+		backend.begin_state_operation(&mut replay, genesis).unwrap();
+		let (_, changes) = replay.state().unwrap().unwrap().storage_root(
+			[(genesis.as_ref(), Some(genesis.as_ref()))].into_iter(),
+			StateVersion::V1,
+		);
+		replay.update_db_storage(changes).unwrap();
+		for hash in [block1, block2, block3] {
+			replay.mark_finalized(hash, None).unwrap();
+		}
+		let header = backend.blockchain().header(block1).unwrap().unwrap();
+		replay
+			.set_block_data(header, Some(vec![]), None, None, NewBlockState::Normal, true)
+			.unwrap();
+		backend.commit_operation(replay).unwrap();
+
+		assert_eq!(backend.blockchain().info().finalized_hash, block3);
+		assert_eq!(backend.blockchain().info().finalized_state, Some((block3, 3)));
+		assert!(backend.have_state_at(block3, 3));
+	}
+
+	#[test]
+	fn state_replay_repairs_checkpoint_after_finalized_revert() {
+		for reopen_before_replay in [false, true] {
+			let directory = tempfile::tempdir().unwrap();
+			let open_backend = || {
+				Backend::<Block>::new(
+					DatabaseSettings {
+						trie_cache_maximum_size: None,
+						state_pruning: Some(PruningMode::ArchiveAll),
+						blocks_pruning: BlocksPruning::KeepAll,
+						pruning_filters: Vec::new(),
+						source: DatabaseSource::ParityDb { path: directory.path().into() },
+						metrics_registry: None,
+					},
+					u64::MAX,
+				)
+				.unwrap()
+			};
+			let mut backend = open_backend();
+			let genesis = insert_header(&backend, 0, H256::zero(), None, H256::zero());
+			let block1 = insert_header(&backend, 1, genesis, None, H256::zero());
+			let block2 = insert_header(&backend, 2, block1, None, H256::zero());
+			let block3 = insert_header(&backend, 3, block2, None, H256::zero());
+			for hash in [block1, block2, block3] {
+				backend.finalize_block(hash, None).unwrap();
+			}
+			backend.revert(1, true).unwrap();
+			assert_eq!(backend.blockchain().info().finalized_hash, block2);
+			assert!(backend.blockchain().header(block3).unwrap().is_none());
+			if reopen_before_replay {
+				drop(backend);
+				backend = open_backend();
+			}
+
+			let header = backend.blockchain().header(block2).unwrap().unwrap();
+			let mut replay = backend.begin_operation().unwrap();
+			backend.begin_state_operation(&mut replay, block1).unwrap();
+			let (_, changes) = replay.state().unwrap().unwrap().storage_root(
+				[(block1.as_ref(), Some(block1.as_ref()))].into_iter(),
+				StateVersion::V1,
+			);
+			replay.update_db_storage(changes).unwrap();
+			replay
+				.set_block_data(header, Some(vec![]), None, None, NewBlockState::Normal, true)
+				.unwrap();
+			backend.commit_operation(replay).unwrap();
+			assert_eq!(backend.blockchain().info().finalized_state, Some((block2, 2)));
+
+			// A header-only tip prevents startup's in-memory fallback from masking a stale key.
+			let header = Header {
+				number: 3,
+				parent_hash: block2,
+				state_root: H256::repeat_byte(9),
+				extrinsics_root: H256::zero(),
+				digest: Default::default(),
+			};
+			let tip = header.hash();
+			let mut operation = backend.begin_operation().unwrap();
+			operation
+				.set_block_data(header, None, None, None, NewBlockState::Best, true)
+				.unwrap();
+			backend.commit_operation(operation).unwrap();
+			backend.finalize_block(tip, None).unwrap();
+			assert!(!backend.have_state_at(tip, 3));
+
+			drop(backend);
+			let backend = open_backend();
+			assert_eq!(backend.blockchain().info().finalized_hash, tip);
+			assert_eq!(backend.blockchain().info().finalized_state, Some((block2, 2)));
+			assert!(backend.have_state_at(block2, 2));
+		}
+	}
+
+	#[test]
+	fn state_replay_ignores_checkpoint_above_committed_finality() {
+		let backend = Backend::<Block>::new_test_with_tx_storage(BlocksPruning::KeepAll, u64::MAX);
+		let genesis = insert_header(&backend, 0, H256::zero(), None, H256::zero());
+		let block1 = insert_header(&backend, 1, genesis, None, H256::zero());
+		let block2 = insert_header(&backend, 2, block1, None, H256::zero());
+		let block3 = insert_header(&backend, 3, block2, None, H256::zero());
+		let header = backend.blockchain().header(block3).unwrap().unwrap();
+		for hash in [block1, block2, block3] {
+			backend.finalize_block(hash, None).unwrap();
+		}
+		backend.revert(1, true).unwrap();
+
+		// Re-delivery restores the old checkpoint's header and archived state, without finality.
+		let mut operation = backend.begin_operation().unwrap();
+		operation
+			.set_block_data(header.clone(), None, None, None, NewBlockState::Best, true)
+			.unwrap();
+		backend.commit_operation(operation).unwrap();
+		assert_eq!(backend.blockchain().info().finalized_hash, block2);
+		assert_eq!(backend.blockchain().info().finalized_state, Some((block3, 3)));
+		assert!(backend.have_state_at(block3, 3));
+
+		let mut competing3 = header;
+		competing3.state_root = H256::repeat_byte(9);
+		let competing4 = Header {
+			number: 4,
+			parent_hash: competing3.hash(),
+			state_root: H256::repeat_byte(10),
+			extrinsics_root: H256::zero(),
+			digest: Default::default(),
+		};
+		for header in [competing3.clone(), competing4.clone()] {
+			let mut operation = backend.begin_operation().unwrap();
+			operation
+				.set_block_data(header, None, None, None, NewBlockState::Normal, true)
+				.unwrap();
+			backend.commit_operation(operation).unwrap();
+		}
+
+		let mut replay = backend.begin_operation().unwrap();
+		backend.begin_state_operation(&mut replay, block1).unwrap();
+		let (_, changes) = replay
+			.state()
+			.unwrap()
+			.unwrap()
+			.storage_root([(block1.as_ref(), Some(block1.as_ref()))].into_iter(), StateVersion::V1);
+		replay.update_db_storage(changes).unwrap();
+		replay.mark_finalized(competing3.hash(), None).unwrap();
+		replay.mark_finalized(competing4.hash(), None).unwrap();
+		replay.mark_head(competing4.hash()).unwrap();
+		let header = backend.blockchain().header(block2).unwrap().unwrap();
+		replay
+			.set_block_data(header, Some(vec![]), None, None, NewBlockState::Normal, true)
+			.unwrap();
+		backend.commit_operation(replay).unwrap();
+
+		assert_eq!(backend.blockchain().info().finalized_hash, competing4.hash());
+		assert_eq!(backend.blockchain().info().finalized_state, Some((block2, 2)));
+		assert_eq!(backend.blockchain().hash(3).unwrap(), Some(competing3.hash()));
+		assert!(!backend.have_state_at(competing4.hash(), 4));
 	}
 
 	#[test]

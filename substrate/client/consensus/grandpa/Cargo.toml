@@ -61,6 +61,8 @@ assert_matches = { workspace = true }
 finality-grandpa = { features = ["derive-codec", "test-helpers"], workspace = true, default-features = true }
 sc-network-test = { workspace = true }
 sp-keyring = { default-features = true, workspace = true }
+sp-state-machine = { default-features = true, workspace = true }
 sp-tracing = { default-features = true, workspace = true }
 substrate-test-runtime-client = { workspace = true }
+tempfile = { workspace = true }
 tokio = { workspace = true, default-features = true }

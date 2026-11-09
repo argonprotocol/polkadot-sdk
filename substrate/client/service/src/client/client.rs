@@ -578,6 +578,11 @@ where
 		let info = self.backend.blockchain().info();
 		let gap_block =
 			info.block_gap.map_or(false, |gap| *import_headers.post().number() == gap.start);
+		// The first finalized snapshot starts executable history after sparse warp headers.
+		let initial_state_import = finalized &&
+			info.finalized_number.is_zero() &&
+			info.finalized_state.is_none() &&
+			matches!(storage_changes, Some(sc_consensus::StorageChanges::Import(_)));
 
 		// the block is lower than our last finalized block so it must revert
 		// finality, refusing import.
@@ -679,7 +684,8 @@ where
 
 		// Ensure parent chain is finalized to maintain invariant that finality is called
 		// sequentially.
-		if finalized && parent_exists && info.finalized_hash != parent_hash {
+		if finalized && parent_exists && !initial_state_import && info.finalized_hash != parent_hash
+		{
 			self.apply_finality_with_block_hash(
 				operation,
 				parent_hash,
@@ -710,7 +716,11 @@ where
 		// as leaves.
 		let register_as_leaf = origin != BlockOrigin::WarpSync;
 
-		let tree_route = if is_new_best && info.best_hash != parent_hash && parent_exists {
+		let tree_route = if is_new_best &&
+			info.best_hash != parent_hash &&
+			parent_exists &&
+			!initial_state_import
+		{
 			let route_from_best =
 				sp_blockchain::tree_route(self.backend.blockchain(), info.best_hash, parent_hash)?;
 			Some(route_from_best)
@@ -759,7 +769,7 @@ where
 					},
 				};
 
-				if parent_exists {
+				if parent_exists && !initial_state_import {
 					// The stale blocks that will be displaced after the block is finalized.
 					let stale_heads = self.backend.blockchain().displaced_leaves_after_finalizing(
 						hash,
